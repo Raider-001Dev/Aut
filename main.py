@@ -1,8 +1,6 @@
 import os
 import time
-import json
 import logging
-import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -11,6 +9,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+import random
 
 # Logging setup
 logging.basicConfig(
@@ -20,40 +19,32 @@ logging.basicConfig(
 
 TOKEN_FILE = "token.txt"
 
-# Scrape proxy with error handling
-def scrape_proxy():
-    url = "https://www.sslproxies.org/"
-    try:
-        response = requests.get(url, timeout=10)
-        proxies = []
-        if response.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(response.text, "html.parser")
-            rows = soup.find_all("tr")
-            for row in rows:
-                columns = row.find_all("td")
-                if len(columns) > 1:
-                    proxies.append(f"{columns[0].text}:{columns[1].text}")
-        return proxies[:5]
-    except Exception as e:
-        logging.error(f"Failed to scrape proxies: {e}")
-        return []
+# List of random User-Agents
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.5672.63 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.5615.49 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/109.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/113.0.1774.35",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15"
+]
 
-# Configure Selenium WebDriver
+# Configure Selenium WebDriver with randomized User-Agent
 def configure_driver():
     chrome_options = Options()
     chrome_options.add_argument("--incognito")
     chrome_options.add_argument("--start-maximized")
-    chrome_options.add_argument("disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--no-sandbox")
-    
-    proxies = scrape_proxy()
-    if proxies:
-        proxy = proxies[0]
-        chrome_options.add_argument(f"--proxy-server={proxy}")
-        logging.info(f"Using Proxy: {proxy}")
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+    chrome_options.add_argument("--headless=new")  # Optional for headless mode
+    chrome_options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    try:
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+        logging.info("Chrome WebDriver successfully configured and launched.")
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to configure WebDriver: {e}")
+        raise SystemExit("Exiting due to WebDriver initialization failure.")
 
 # GitHub Login with validation
 def github_login(driver, username, password):
@@ -63,10 +54,24 @@ def github_login(driver, username, password):
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "login_field"))).send_keys(username)
         driver.find_element(By.ID, "password").send_keys(password)
         driver.find_element(By.NAME, "commit").click()
-        time.sleep(2)  # Allow time for page to load
+
+        # Check for OTP prompt
+        if "two-factor" in driver.page_source.lower():
+            logging.info("OTP required. Prompting user for input...")
+            otp_code = input("Enter OTP code: ")
+            otp_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "otp")))
+            otp_input.send_keys(otp_code)
+            otp_input.send_keys(Keys.RETURN)
+            time.sleep(2)
+
+        # Check for errors
         if "incorrect" in driver.page_source.lower():
-            logging.error("Login failed: Incorrect username or password")
+            logging.error("Login failed: Incorrect username, password, or OTP.")
             return False
+        if "suspended" in driver.page_source.lower():
+            logging.error("Account suspended or banned.")
+            return False
+
         logging.info("Successfully logged in!")
         return True
     except Exception as e:
@@ -88,31 +93,58 @@ def generate_token(driver):
     except Exception as e:
         logging.error(f"Error generating token: {e}")
 
-# Monitor Codespace with retry mechanism
-def monitor_codespace(driver):
-    while True:
-        try:
-            driver.refresh()
-            if "stopped" in driver.page_source.lower():
-                logging.warning("Codespace stopped! Restarting...")
-                driver.find_element(By.XPATH, "//button[contains(text(), 'Restart')]").click()
-                time.sleep(10)
-            else:
-                logging.info("Codespace is running...")
-            time.sleep(30)
-        except Exception as e:
-            logging.error(f"Error monitoring Codespace: {e}")
-            time.sleep(5)
+# Open Codespace and execute command
+def open_codespace_and_execute(driver):
+    logging.info("Opening GitHub Codespace...")
+    driver.get("https://github.com/codespaces")
+    try:
+        codespace = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/codespaces/')]")))
+        codespace.click()
+        time.sleep(5)  # Wait for Codespace to load
+
+        # Prompt user for terminal command
+        command = input("Enter the command you want to run in the terminal: ")
+        logging.info(f"Executing command: {command}")
+        terminal_input = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//textarea[@data-testid='terminal-input']")))
+        terminal_input.send_keys(command + Keys.RETURN)
+        logging.info("Command executed successfully.")
+    except Exception as e:
+        logging.error(f"Error opening Codespace or executing command: {e}")
+
+# Monitor opened tabs in layout (1 row, 5 tabs)
+def monitor_tabs(driver):
+    logging.info("Setting up monitoring layout...")
+    for i in range(5):
+        driver.execute_script("window.open('https://github.com/codespaces', '_blank');")
+    windows = driver.window_handles
+    for i, window in enumerate(windows):
+        driver.switch_to.window(window)
+        driver.set_window_rect(0 + i * 200, 0, 800, 600)  # Adjust layout
+
+    logging.info("Monitoring tabs initialized. Active tabs:")
+    for i, window in enumerate(windows):
+        driver.switch_to.window(window)
+        logging.info(f"Tab {i+1}: {driver.current_url}")
 
 def main():
-    driver = configure_driver()
-    username = input("Enter GitHub username: ")
-    password = input("Enter GitHub password: ")
-    if github_login(driver, username, password):
-        generate_token(driver)
-        monitor_codespace(driver)
-    else:
-        logging.error("Login failed. Exiting program.")
+    while True:
+        choice = input("Do you want to add a new account or go to monitoring? (new/monitor): ").strip().lower()
+        if choice == "new":
+            driver = configure_driver()
+            username = input("Enter GitHub username: ")
+            password = input("Enter GitHub password: ")
+
+            if github_login(driver, username, password):
+                generate_token(driver)
+                open_codespace_and_execute(driver)
+
+        elif choice == "monitor":
+            driver = configure_driver()
+            monitor_tabs(driver)
+            break
+
+        else:
+            logging.warning("Invalid choice. Please select 'new' or 'monitor'.")
 
 if __name__ == "__main__":
     main()
